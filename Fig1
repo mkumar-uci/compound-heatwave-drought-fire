@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Figure 1. Spatial distribution of class-specific fire-season burned-area rates.
+Figure 1. Spatial distribution of class specific fire-season burned-area rates.
 
 Each ecoregion is colored by its burned area rate (%BA Day^-1) per day of
 the given class, averaged over the 2001-2024 fire seasons:
