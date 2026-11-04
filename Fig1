@@ -1,1 +1,192 @@
+#!/usr/bin/env python3
+"""
+Figure 1. Spatial distribution of class-specific fire-season burned-area rates.
 
+Each ecoregion is colored by its burned area rate (%BA Day^-1) per day of
+the given class, averaged over the 2001-2024 fire seasons:
+  (a) compound heatwave-drought (CHD) days
+  (b) heatwave-only days
+  (c) drought-only days
+  (d) non-extreme days
+
+Excluded ecoregions:
+  - unburnable ecoregions (FOREST == "Unburnable" in the ecoregion shapefile)
+  - cropland-dominated ecoregions (cropland_dominated_fs_low_50pct == 1)
+
+Inputs (place in DATA_DIR, or set the CHD_DATA_DIR environment variable):
+  chd_statistics_classdaynorm_per_year.nc
+      Per-ecoregion fire-season statistics: class-day counts, burned area and
+      class-specific burned-area rates, 2001-2024 (4-month fire season,
+      SPEI-3, 20th-percentile drought threshold).
+  ecoregion_metadata.csv
+      One row per ecoregion: ecoregion, biome_name, forest_class,
+      cropland_dominated_fs_low_50pct.
+  Ecoregions2017/Ecoregions2017_final.shp
+      Ecoregion polygons (RESOLVE Ecoregions 2017) with a FOREST attribute.
+
+Output (OUT_DIR, or the CHD_OUT_DIR environment variable):
+  fig1_map_ba_rate_by_class.png
+"""
+
+import os
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+# =============================================================================
+# Paths
+# =============================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "chd_statistics_classdaynorm_per_year.nc"
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+ECO_SHP = DATA_DIR / "Ecoregions2017" / "Ecoregions2017_final.shp"
+OUT_FIG = OUT_DIR / "fig1_map_ba_rate_by_class.png"
+
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+
+RATE_COLS = {
+    "ba_rate_chd_perCHD":          "CHD",
+    "ba_rate_heatwave_only_perHW": "HW-only",
+    "ba_rate_drought_only_perDR":  "DR-only",
+    "ba_rate_no_extremes_perNE":   "Non-extreme",
+}
+
+for f in (STATS_FILE, META_CSV, ECO_SHP):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+# =============================================================================
+# Load rates and apply the cropland filter
+# =============================================================================
+meta = pd.read_csv(META_CSV)
+if CROPLAND_COL not in meta.columns:
+    raise KeyError(f"Metadata CSV is missing column '{CROPLAND_COL}'.")
+cmask = meta[["ecoregion", CROPLAND_COL]].drop_duplicates(subset="ecoregion")
+
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in RATE_COLS if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    rates = ds[list(RATE_COLS)].to_dataframe().reset_index()
+
+print(f"Ecoregions in NetCDF: {rates['ecoregion'].nunique()}")
+
+df = rates.merge(cmask, on="ecoregion", how="inner", validate="one_to_one")
+df = df[df[CROPLAND_COL] == 0].copy()
+print(f"Ecoregions after cropland filter: {df['ecoregion'].nunique()}")
+
+# A class with zero days in an ecoregion gives an undefined rate.
+df[list(RATE_COLS)] = df[list(RATE_COLS)].replace([np.inf, -np.inf], np.nan)
+
+# =============================================================================
+# Summary statistics (across ecoregions)
+# =============================================================================
+print("\nClass-specific %BA day^-1 across ecoregions")
+print(f"{'Class':<12} {'n':>5} {'Mean':>9} {'Median':>9} {'Max':>9}")
+summary = {}
+for col, label in RATE_COLS.items():
+    v = df[col].dropna()
+    summary[label] = {"mean": v.mean(), "median": v.median()}
+    print(f"{label:<12} {len(v):>5} {v.mean():>9.4f} {v.median():>9.4f} {v.max():>9.4f}")
+
+print("\nCHD rate relative to other classes")
+print(f"{'vs':<12} {'ratio (means)':>14} {'ratio (medians)':>16}")
+for label in ["HW-only", "DR-only", "Non-extreme"]:
+    r_mean = summary["CHD"]["mean"] / summary[label]["mean"]
+    r_med = summary["CHD"]["median"] / summary[label]["median"]
+    print(f"{label:<12} {r_mean:>14.2f} {r_med:>16.2f}")
+
+# =============================================================================
+# Merge with ecoregion polygons
+# =============================================================================
+gdf = gpd.read_file(ECO_SHP)
+gdf = gdf[gdf["FOREST"] != "Unburnable"].to_crs(epsg=4326)
+print(f"\nBurnable ecoregion polygons: {len(gdf)}")
+
+gdf = gdf.merge(df[["ecoregion", *RATE_COLS]],
+                left_on="ECO_NAME", right_on="ecoregion", how="left")
+n_unmatched = df.loc[~df["ecoregion"].isin(gdf["ECO_NAME"]), "ecoregion"].nunique()
+if n_unmatched:
+    print(f"WARNING: {n_unmatched} ecoregions in the data have no matching polygon.")
+
+# =============================================================================
+# Colour scale
+# =============================================================================
+BOUNDS = np.array([0.0, 0.3, 0.6, 0.9, 1.2, 1.8, 3.0, 6.0, 8.0, 10.0, 15.0])
+COLORS = [
+    "#fff5f0", "#fee5d9", "#fcbba1", "#fc9272", "#fb6a4a",
+    "#ef3b2c", "#cb181d", "#a50f15", "#67000d", "#3b0008",
+]
+MISSING_COLOR = "white"   # cropland-dominated or undefined-rate ecoregions
+
+cmap = mcolors.ListedColormap(COLORS)
+cmap.set_over(COLORS[-1])
+norm = mcolors.BoundaryNorm(BOUNDS, ncolors=len(COLORS))
+
+# Values above the top bound share the darkest colour; mark this on the colour bar.
+max_rate = float(np.nanmax(df[list(RATE_COLS)].to_numpy()))
+cbar_extend = "max" if max_rate > BOUNDS[-1] else "neither"
+print(f"Maximum rate across panels: {max_rate:.2f} (colour bar extend = '{cbar_extend}')")
+
+# =============================================================================
+# Plot
+# =============================================================================
+fig = plt.figure(figsize=(18, 8.7))
+proj = ccrs.PlateCarree()
+EXTENT = [-180, 180, -60, 80]
+
+
+def draw_panel(ax, column, title):
+    gdf.plot(
+        column=column,
+        ax=ax,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        norm=norm,
+        linewidth=0.1,
+        edgecolor="black",
+        missing_kwds={"color": MISSING_COLOR},
+        legend=False,
+    )
+    ax.coastlines(linewidth=1.0, color="black")
+    ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
+    ax.set_title(title, fontsize=18, fontweight="bold", pad=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
+        spine.set_linewidth(1.5)
+
+
+panels = [
+    ("ba_rate_chd_perCHD",          "(a) CHD"),
+    ("ba_rate_heatwave_only_perHW", "(b) HW-only"),
+    ("ba_rate_drought_only_perDR",  "(c) DR-only"),
+    ("ba_rate_no_extremes_perNE",   "(d) Non-extreme"),
+]
+for i, (col, title) in enumerate(panels, start=1):
+    draw_panel(plt.subplot(2, 2, i, projection=proj), col, title)
+
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar_ax = fig.add_axes([0.15, 0.11, 0.70, 0.025])
+cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend=cbar_extend)
+cbar.set_ticks(BOUNDS)
+cbar.ax.set_xticklabels([f"{b:.2f}" for b in BOUNDS], fontweight="bold")
+cbar.ax.tick_params(labelsize=16, width=1.5, length=5)
+cbar.ax.text(1.01, 0.4, "%BA day$^{-1}$", fontsize=16, fontweight="bold",
+             transform=cbar.ax.transAxes, va="center", ha="left")
+
+plt.subplots_adjust(left=0.03, right=0.97, top=0.96, bottom=0.15,
+                    wspace=0.03, hspace=0.06)
+plt.savefig(OUT_FIG, dpi=600, bbox_inches="tight")
+print(f"\nSaved: {OUT_FIG}")
+plt.show()
+plt.close(fig)
