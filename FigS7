@@ -3,7 +3,6 @@
 Figure S7. Change in CHD frequency and CHD potency between 2001-2012 and
 2013-2024.
 """
-
 import os
 from pathlib import Path
 
