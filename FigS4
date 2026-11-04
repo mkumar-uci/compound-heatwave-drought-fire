@@ -1,1 +1,145 @@
+#!/usr/bin/env python3
+"""
+Figure S4. Difference in class specific fire-season burned area rate between
+CHD days and each other class, by ecoregion (2001-2024 mean). 
+"""
 
+import os
+import warnings
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+warnings.filterwarnings("ignore", message="Geometry is in a geographic CRS")
+
+# ---------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "chd_statistics_classdaynorm_per_year.nc"
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+ECO_SHP = DATA_DIR / "Ecoregions2017" / "Ecoregions2017_final.shp"
+OUT_FIG = OUT_DIR / "figS4_map_ba_rate_difference.png"
+
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+RATE_COLS = [
+    "ba_rate_chd_perCHD",
+    "ba_rate_heatwave_only_perHW",
+    "ba_rate_drought_only_perDR",
+    "ba_rate_no_extremes_perNE",
+]
+
+for f in (STATS_FILE, META_CSV, ECO_SHP):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+# ---------------------------------------------------------------------
+# Load rates and apply the cropland filter
+# ---------------------------------------------------------------------
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in RATE_COLS if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    rates = ds[RATE_COLS].to_dataframe().reset_index()
+
+meta = pd.read_csv(META_CSV)
+if CROPLAND_COL not in meta.columns:
+    raise KeyError(f"Metadata CSV is missing column '{CROPLAND_COL}'.")
+cmask = meta[["ecoregion", CROPLAND_COL]].drop_duplicates(subset="ecoregion")
+
+df = rates.merge(cmask, on="ecoregion", how="inner", validate="one_to_one")
+df = df[df[CROPLAND_COL] == 0].copy()
+print(f"Ecoregions after cropland filter: {df['ecoregion'].nunique()}")
+
+df[RATE_COLS] = df[RATE_COLS].replace([np.inf, -np.inf], np.nan)
+
+# ---------------------------------------------------------------------
+# Differences (CHD minus each other class)
+# ---------------------------------------------------------------------
+DIFFS = {
+    "diff_chd_hw": ("ba_rate_heatwave_only_perHW", "(a) CHD – HW-only"),
+    "diff_chd_dr": ("ba_rate_drought_only_perDR", "(b) CHD – DR-only"),
+    "diff_chd_ne": ("ba_rate_no_extremes_perNE", "(c) CHD – Non-extreme"),
+}
+for col, (other, _) in DIFFS.items():
+    df[col] = df["ba_rate_chd_perCHD"] - df[other]
+
+LIMIT = 6.0
+print("\nCHD minus other class, %BA day^-1 (across ecoregions):")
+for col, (_, title) in DIFFS.items():
+    v = df[col].dropna()
+    print(f"  {title[4:]:<22} n = {len(v):>3}  median = {v.median():.3f}  "
+          f"mean = {v.mean():.3f}  CHD > other in {100 * (v > 0).mean():.1f}% of ecoregions  "
+          f"|diff| > {LIMIT:g} in {(v.abs() > LIMIT).sum()} ecoregions")
+
+# ---------------------------------------------------------------------
+# Merge with ecoregion polygons
+# ---------------------------------------------------------------------
+gdf = gpd.read_file(ECO_SHP)
+gdf = gdf[gdf["FOREST"] != "Unburnable"].to_crs(epsg=4326)
+print(f"\nBurnable ecoregion polygons: {len(gdf)}")
+
+gdf = gdf.merge(df[["ecoregion", *DIFFS]], left_on="ECO_NAME",
+                right_on="ecoregion", how="left")
+n_unmatched = df.loc[~df["ecoregion"].isin(gdf["ECO_NAME"]), "ecoregion"].nunique()
+if n_unmatched:
+    print(f"WARNING: {n_unmatched} ecoregions in the data have no matching polygon.")
+
+# ---------------------------------------------------------------------
+# Discrete, symmetric diverging colour scale
+# ---------------------------------------------------------------------
+BOUNDS = np.array([-6, -5, -4, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 4, 5, 6], dtype=float)
+cmap = plt.cm.RdBu_r
+norm = mcolors.BoundaryNorm(boundaries=BOUNDS, ncolors=cmap.N, clip=False)
+
+# ---------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------
+fig = plt.figure(figsize=(16, 10))
+proj = ccrs.PlateCarree()
+EXTENT = [-180, 180, -60, 80]
+
+for i, (col, (_, title)) in enumerate(DIFFS.items(), start=1):
+    ax = plt.subplot(3, 1, i, projection=proj)
+    gdf.plot(
+        column=col,
+        ax=ax,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        norm=norm,
+        linewidth=0.1,
+        edgecolor="black",
+        missing_kwds={"color": "white"},
+        legend=False,
+    )
+    ax.coastlines(linewidth=1.0, color="black")
+    ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
+    ax.set_title(title, fontsize=16, fontweight="bold", pad=6)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
+        spine.set_linewidth(1.0)
+
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar_ax = fig.add_axes([0.30, 0.068, 0.403, 0.02])
+cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="both")
+cbar.outline.set_linewidth(0.3)
+cbar.set_ticks(BOUNDS)
+cbar.ax.set_xticklabels([f"{b:.1f}" for b in BOUNDS], fontweight="bold")
+cbar.ax.tick_params(labelsize=12, width=1.5, length=4)
+cbar.ax.set_xlabel("Δ %BA day$^{-1}$", fontsize=12, fontweight="bold")
+
+plt.subplots_adjust(left=0.03, right=0.97, top=0.96, bottom=0.12, hspace=0.15)
+plt.savefig(OUT_FIG, dpi=600, bbox_inches="tight")
+print(f"\nSaved: {OUT_FIG}")
+plt.show()
+plt.close(fig)
