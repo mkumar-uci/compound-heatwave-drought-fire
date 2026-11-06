@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+Figure S8. Change in CHD frequency and CHD potency between 2001-2012 and
+2013-2024.
+"""
+import os
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+from matplotlib.patches import Patch
+
+# ------------------------------------------------------------------
+# Paths and settings
+# ------------------------------------------------------------------
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "chd_statistics_classdaynorm_per_year.nc"
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+OUT_FIG = OUT_DIR / "figS7_chd_frequency_potency.png"
+OUT_CSV = OUT_DIR / "figS7_ecoregion_frequency_potency.csv"
+
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+EARLY_YEARS = np.arange(2001, 2013)
+LATE_YEARS = np.arange(2013, 2025)
+MIN_CHD_DAYS_PER_YR = 0.1   # minimum mean CHD days per fire season, 2001-2024
+N_BOOT = 10000
+SEED = 42
+ALPHA = 0.05   # two-sided significance level
+
+COLOR_VEG = {"forest": "#2d7f2d", "nonforest": "#c66b2e"}
+COLOR_METRIC = {"fold_freq": "#4393c3", "fold_pot": "#d6604d"}
+METRIC_LABEL = {"fold_freq": "CHD days", "fold_pot": "BA day$^{-1}$"}
+
+plt.rcParams.update({
+    "font.size": 11, "axes.labelsize": 13, "axes.titlesize": 13,
+    "xtick.labelsize": 11, "ytick.labelsize": 11,
+    "legend.fontsize": 11, "axes.linewidth": 1.5,
+})
+
+for f in (STATS_FILE, META_CSV):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+# ------------------------------------------------------------------
+# 1. Load annual variables (dimensions: year, ecoregion)
+# ------------------------------------------------------------------
+YEARLY_VARS = ["fs_days_yearly", "chd_days_yearly", "ba_chd_yearly"]
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in YEARLY_VARS + ["chd_days_mean_24yr"] if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    df_ann = ds[YEARLY_VARS].to_dataframe().reset_index()
+    chd_mean = ds[["chd_days_mean_24yr"]].to_dataframe().reset_index()
+
+df_ann["year"] = pd.to_numeric(df_ann["year"], errors="coerce")
+df_ann = df_ann.merge(chd_mean, on="ecoregion", how="left", validate="many_to_one")
+
+# ------------------------------------------------------------------
+# 2. Metadata, cropland filter and minimum-CHD-days filter
+# ------------------------------------------------------------------
+meta_cols = ["ecoregion", "biome_name", "forest_class", CROPLAND_COL]
+meta = pd.read_csv(META_CSV)
+missing_meta = [c for c in meta_cols if c not in meta.columns]
+if missing_meta:
+    raise KeyError(f"Metadata CSV is missing columns: {missing_meta}")
+meta = meta[meta_cols].drop_duplicates(subset="ecoregion")
+
+df_ann = df_ann.merge(meta, on="ecoregion", how="inner", validate="many_to_one")
+df_ann = df_ann[df_ann[CROPLAND_COL] == 0].copy()
+print(f"Ecoregions after cropland filter: {df_ann['ecoregion'].nunique()}")
+
+df_ann = df_ann[df_ann["chd_days_mean_24yr"] >= MIN_CHD_DAYS_PER_YR].copy()
+print(f"Ecoregions with >= {MIN_CHD_DAYS_PER_YR} mean CHD days per fire season: "
+      f"{df_ann['ecoregion'].nunique()}")
+
+df_ann["veg_type"] = np.where(df_ann["forest_class"].astype(str).str.strip() == "Forest",
+                              "forest", "nonforest")
+
+
+def ratio(late, early):
+    """late / early, undefined when early is zero or either value is missing."""
+    return late / early if (np.isfinite(early) and np.isfinite(late) and early > 0) else np.nan
+
+
+# ------------------------------------------------------------------
+# 3. Per-ecoregion ratios
+# ------------------------------------------------------------------
+df_ann["frac_chd"] = df_ann["chd_days_yearly"] / df_ann["fs_days_yearly"].replace(0, np.nan)
+df_ann["ba_per_chd_day"] = df_ann["ba_chd_yearly"] / df_ann["chd_days_yearly"].replace(0, np.nan)
+
+rows = []
+for eco, sub in df_ann.groupby("ecoregion", sort=True):
+    early = sub[sub["year"].isin(EARLY_YEARS)]
+    late = sub[sub["year"].isin(LATE_YEARS)]
+
+    freq_early, freq_late = early["frac_chd"].mean(), late["frac_chd"].mean()
+    pot_early, pot_late = early["ba_per_chd_day"].mean(), late["ba_per_chd_day"].mean()
+    ba_early, ba_late = early["ba_chd_yearly"].sum(), late["ba_chd_yearly"].sum()
+
+    rows.append({
+        "ecoregion": eco,
+        "biome": sub["biome_name"].iloc[0],
+        "veg_type": sub["veg_type"].iloc[0],
+        "freq_early": freq_early, "freq_late": freq_late,
+        "fold_freq": ratio(freq_late, freq_early),
+        "potency_early": pot_early, "potency_late": pot_late,
+        "fold_pot": ratio(pot_late, pot_early),
+        "fold_ba_chd": ratio(ba_late, ba_early),
+    })
+
+eco_df = pd.DataFrame(rows)
+eco_df.to_csv(OUT_CSV, index=False)
+print(f"Saved per-ecoregion table: {OUT_CSV}")
+for col in ["fold_freq", "fold_pot", "fold_ba_chd"]:
+    print(f"  {col:<12} undefined (excluded) in {eco_df[col].isna().sum()} of {len(eco_df)} ecoregions")
+
+
+def bootstrap_median_vs_one(values, n_boot=N_BOOT, seed=SEED):
+    """One-sample bootstrap of the median ratio; p = P(boot median <= 1)."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return None
+    rng = np.random.default_rng(seed)
+    boot = np.array([np.median(rng.choice(v, size=v.size, replace=True))
+                     for _ in range(n_boot)])
+    ci_low, ci_high = np.percentile(boot, [2.5, 97.5])
+    return {"obs": float(np.median(v)), "ci_low": ci_low, "ci_high": ci_high,
+            "p_le_one": float((boot <= 1.0).mean()), "n": v.size}
+
+
+def is_significant(res):
+    """Two-sided test at ALPHA: the bootstrap CI excludes 1."""
+    return res is not None and (res["p_le_one"] < ALPHA / 2
+                                or res["p_le_one"] > 1 - ALPHA / 2)
+
+
+def describe(res):
+    if res["p_le_one"] < ALPHA / 2:
+        return "significant increase"
+    if res["p_le_one"] > 1 - ALPHA / 2:
+        return "significant decrease"
+    return "not significant"
+
+
+# ------------------------------------------------------------------
+# 4. Summary statistics
+# ------------------------------------------------------------------
+print(f"\n=== All ecoregions: median ratio vs. 1 (two-sided bootstrap, alpha = {ALPHA}) ===")
+for col, label in [("fold_freq", "CHD frequency"), ("fold_pot", "CHD potency"),
+                   ("fold_ba_chd", "BA on CHD days")]:
+    res = bootstrap_median_vs_one(eco_df[col])
+    if res:
+        print(f"  {label:<15} n = {res['n']:>3}  median = {res['obs']:.3f}  "
+              f"95% CI [{res['ci_low']:.3f}, {res['ci_high']:.3f}]  "
+              f"P(boot <= 1) = {res['p_le_one']:.4f}  ({describe(res)})")
+
+print("\n=== By vegetation type ===")
+fold_sig_veg = {"forest": {}, "nonforest": {}}
+for veg in ["forest", "nonforest"]:
+    sub = eco_df[eco_df["veg_type"] == veg]
+    for col in ["fold_freq", "fold_pot"]:
+        res = bootstrap_median_vs_one(sub[col])
+        fold_sig_veg[veg][col] = res
+        if res:
+            print(f"  {veg:<9} {col:<9} n = {res['n']:>3}  median = {res['obs']:.3f}  "
+                  f"95% CI [{res['ci_low']:.3f}, {res['ci_high']:.3f}]  "
+                  f"P(boot <= 1) = {res['p_le_one']:.4f}  ({describe(res)})")
+
+biome_summary = (eco_df.groupby("biome")[["fold_freq", "fold_pot"]].median()
+                       .dropna(how="all")
+                       .sort_values("fold_freq", ascending=True))
+
+print("\n=== By biome ===")
+biome_stars = {}
+for biome in biome_summary.index:
+    sub = eco_df[eco_df["biome"] == biome]
+    biome_stars[biome] = {}
+    for col in ["fold_freq", "fold_pot"]:
+        res = bootstrap_median_vs_one(sub[col])
+        biome_stars[biome][col] = is_significant(res)
+        if res:
+            print(f"  {biome[:45]:<45} {col:<9} n = {res['n']:>3}  median = {res['obs']:.3f}  "
+                  f"P(boot <= 1) = {res['p_le_one']:.4f}  ({describe(res)})")
+
+# ------------------------------------------------------------------
+# 5. Figure
+# ------------------------------------------------------------------
+fig, (ax_a, ax_b) = plt.subplots(2, 1, figsize=(11, 10),
+                                 gridspec_kw={"height_ratios": [1, 1.8]})
+
+# Panel A: hatched bars = potency, plain bars = frequency
+x = np.array([0.0, 1.0])
+width = 0.32
+hatch = {"fold_freq": "", "fold_pot": "///"}
+edge = {"fold_freq": "none", "fold_pot": "black"}
+
+panel_a_max = 0.0
+for j, col in enumerate(["fold_freq", "fold_pot"]):
+    for k, veg in enumerate(["forest", "nonforest"]):
+        vals = eco_df.loc[eco_df["veg_type"] == veg, col].dropna()
+        med = float(np.median(vals)) if len(vals) else np.nan
+        panel_a_max = np.nanmax([panel_a_max, med])
+        bar = ax_a.bar(x[k] + (j - 0.5) * width, med, width, color=COLOR_VEG[veg],
+                       hatch=hatch[col], edgecolor=edge[col], linewidth=0.8, alpha=0.85)
+        if is_significant(fold_sig_veg[veg].get(col)):
+            ax_a.text(bar[0].get_x() + bar[0].get_width() / 2, bar[0].get_height() - 0.05,
+                      "*", ha="center", va="bottom", fontsize=16, fontweight="bold",
+                      color=COLOR_VEG[veg])
+
+ax_a.axhline(1.0, color="grey", linewidth=1.0, linestyle="-.")
+ax_a.set_xticks(x)
+ax_a.set_xticklabels(["Forest", "Non-forest"], fontsize=12)
+ax_a.set_ylabel("Ratio (2013–2024 / 2001–2012)", fontsize=12)
+ax_a.set_ylim(0, 3.1 if panel_a_max <= 3.1 else panel_a_max * 1.1)
+ax_a.set_title("(a) CHD days and BA day$^{-1}$: Forest vs. Non-forest", fontsize=13)
+ax_a.tick_params(width=1.5, length=5)
+leg = ax_a.legend(handles=[
+    Patch(facecolor="white", edgecolor="grey", hatch=hatch[c], label=METRIC_LABEL[c])
+    for c in ["fold_freq", "fold_pot"]], frameon=True, loc="upper right", fontsize=10)
+leg.get_frame().set_edgecolor("lightgray")
+leg.get_frame().set_linewidth(0.8)
+
+# Panel B
+biomes = biome_summary.index.tolist()
+y = np.arange(len(biomes))
+h = 0.32
+xmax_b = float(np.nanmax(biome_summary[["fold_freq", "fold_pot"]].to_numpy()))
+star_nudge = max(3.0, np.ceil(xmax_b * 1.01)) * 0.02
+
+ax_b.barh(y + h / 2, biome_summary["fold_freq"].to_numpy(), height=h,
+          color=COLOR_METRIC["fold_freq"], label=METRIC_LABEL["fold_freq"], edgecolor="none")
+ax_b.barh(y - h / 2, biome_summary["fold_pot"].to_numpy(), height=h,
+          color=COLOR_METRIC["fold_pot"], label=METRIC_LABEL["fold_pot"], edgecolor="none")
+
+ax_b.axvline(1.0, color="grey", linewidth=1.0, linestyle="-.")
+ax_b.set_xlim(0, 8.3 if xmax_b <= 8.3 else xmax_b * 1.1)
+ax_b.set_ylim(-0.6, len(biomes) - 0.4)
+ax_b.set_yticks(y)
+ax_b.set_yticklabels(biomes, fontsize=10)
+ax_b.set_xlabel("Ratio (2013–2024 / 2001–2012)", fontsize=13)
+ax_b.set_title("(b) CHD days and BA day$^{-1}$ by biome", fontsize=13)
+ax_b.legend(frameon=False, loc="lower right", fontsize=11)
+ax_b.tick_params(width=1.5, length=5)
+
+for i, biome in enumerate(biomes):
+    for col, y_off in [("fold_freq", h / 2), ("fold_pot", -h / 2)]:
+        val = biome_summary.loc[biome, col]
+        if biome_stars[biome].get(col) and np.isfinite(val):
+            ax_b.text(val + star_nudge, y[i] + y_off - 0.08, "*",
+                      color=COLOR_METRIC[col], va="center", ha="left",
+                      fontsize=14, fontweight="bold")
+
+# Black frame on all four sides of both panels.
+for ax in (ax_a, ax_b):
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(1.5)
+
+plt.tight_layout()
+plt.subplots_adjust(hspace=0.17)
+plt.savefig(OUT_FIG, dpi=600, bbox_inches="tight")
+print(f"\nSaved: {OUT_FIG}")
+plt.show()
+plt.close(fig)
