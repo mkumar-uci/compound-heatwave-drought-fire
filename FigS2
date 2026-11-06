@@ -20,7 +20,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 STATS_FILE = DATA_DIR / "fire_season_statistics.nc"
 OUT_FIG = OUT_DIR / "figS2_hist_fire_season_start.png"
 
-MIN_BA_FS = 1000   # same as units of ba_total_fs in STATS_FILE
+MIN_BA_FS = 1000   # sq. km # same as units of ba_total_fs in STATS_FILE
 
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
