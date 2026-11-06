@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+Figure S9. Annual fire-season burned area and its 5-year moving average,
+by condition and vegetation type, 2001-2024.
+"""
+
+import os
+from pathlib import Path
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator, ScalarFormatter
+from scipy import stats
+
+# =====================================================================
+# Paths and settings
+# =====================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "chd_statistics_classdaynorm_per_year.nc"
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+OUT_STEM = "figS9_ba_5yr_moving_average"
+
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+YEARS = np.arange(2001, 2025)
+WINDOW = 5
+DPI = 600
+Y_LABEL = "Burned area (km$^{2}$)"
+
+MECH_VARS = {
+    "ba_chd_yearly":           "CHD",
+    "ba_heatwave_only_yearly": "HW-only",
+    "ba_drought_only_yearly":  "DR-only",
+    "ba_no_extremes_yearly":   "Non-extreme",
+}
+MECH_ORDER = ["CHD", "HW-only", "DR-only", "Non-extreme"]
+MECH_COLOR = {"Non-extreme": "#b0b0b0", "HW-only": "#fbb4ae",
+              "DR-only": "#fb8072", "CHD": "k"}
+VEG_ORDER = ["forest", "nonforest"]
+VEG_LABEL = {"forest": "Forest", "nonforest": "Non-forest"}
+BAR_ALPHA = 0.55
+BAR_ALPHA_OVERRIDE = {"CHD": 0.30}   # lighter black bars so the black line stands out
+LINE_DARKEN = 0.40                    # moving-average line: colour mixed 40% toward black
+
+for f in (STATS_FILE, META_CSV):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+
+# =====================================================================
+# Trend statistics (annual, unsmoothed series)
+# =====================================================================
+def sen_slope(years, values):
+    """Theil-Sen slope, in burned-area units per year."""
+    x = np.asarray(years, dtype=float)
+    y = np.asarray(values, dtype=float)
+    if len(y) < 2:
+        return np.nan
+    i, j = np.triu_indices(len(y), k=1)
+    dx = x[j] - x[i]
+    valid = dx != 0
+    return float(np.median((y[j][valid] - y[i][valid]) / dx[valid])) if valid.any() else np.nan
+
+
+def mann_kendall_hamed_rao(years, values, alpha=0.05):
+    """Mann-Kendall test with the Hamed and Rao (1998) variance correction,
+    using significant lag autocorrelations of the ranks of the Sen-detrended series."""
+    years = np.asarray(years, dtype=float)
+    y = np.asarray(values, dtype=float)
+    ok = np.isfinite(years) & np.isfinite(y)
+    years, y = years[ok], y[ok]
+    n = len(y)
+    if n < 8:
+        return {"z": np.nan, "p": np.nan, "sen_slope": np.nan}
+
+    i, j = np.triu_indices(n, k=1)
+    s_stat = int(np.sum(np.sign(y[j] - y[i])))
+    _, counts = np.unique(y, return_counts=True)
+    var_s = (n * (n - 1) * (2 * n + 5)
+             - np.sum(counts * (counts - 1) * (2 * counts + 5))) / 18.0
+
+    slope = sen_slope(years, y)
+    ranks = stats.rankdata(y - slope * years)
+    ranks = ranks - ranks.mean()
+    denom = np.sum(ranks ** 2)
+    z_crit = stats.norm.ppf(1 - alpha / 2)
+    corr_sum = 0.0
+    for lag in range(1, n - 2):
+        rho = np.sum(ranks[:-lag] * ranks[lag:]) / denom if denom > 0 else 0.0
+        if abs(rho) > z_crit / np.sqrt(n):
+            corr_sum += (n - lag) * (n - lag - 1) * (n - lag - 2) * rho
+    var_s *= max(1.0 + 2.0 * corr_sum / (n * (n - 1) * (n - 2)), 1.0)
+
+    if var_s <= 0 or s_stat == 0:
+        z = 0.0
+    else:
+        z = (s_stat - np.sign(s_stat)) / np.sqrt(var_s)
+    return {"z": float(z), "p": float(2 * stats.norm.sf(abs(z))), "sen_slope": slope}
+
+
+def pct_per_decade(slope, mean_value):
+    if not (np.isfinite(slope) and np.isfinite(mean_value)) or mean_value <= 0:
+        return np.nan
+    return 100.0 * slope * 10.0 / mean_value
+
+
+# =====================================================================
+# Load and aggregate
+# =====================================================================
+load_vars = ["ba_total_fs_yearly", *MECH_VARS]
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in load_vars if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    df = ds[load_vars].to_dataframe().reset_index()
+
+df["year"] = pd.to_numeric(df["year"], errors="coerce")
+df = df[df["year"].isin(YEARS)].copy()
+df["year"] = df["year"].astype(int)
+
+resid = (df["ba_total_fs_yearly"] - df[list(MECH_VARS)].sum(axis=1, min_count=1)).abs()
+print(f"Max |total - sum of classes| = {resid.max():.4g} "
+      f"({100 * resid.max() / df['ba_total_fs_yearly'].abs().max():.2g}% of the largest annual total)")
+
+meta_cols = ["ecoregion", "forest_class", CROPLAND_COL]
+meta = pd.read_csv(META_CSV)
+missing_meta = [c for c in meta_cols if c not in meta.columns]
+if missing_meta:
+    raise KeyError(f"Metadata CSV is missing columns: {missing_meta}")
+meta = meta[meta_cols].drop_duplicates(subset="ecoregion")
+
+df = df.merge(meta, on="ecoregion", how="inner", validate="many_to_one")
+df = df[df[CROPLAND_COL] == 0].copy()
+df["veg_type"] = np.where(df["forest_class"].astype(str).str.strip() == "Forest",
+                          "forest", "nonforest")
+print("Ecoregions after cropland filter:", df["ecoregion"].nunique(),
+      df.groupby("veg_type")["ecoregion"].nunique().to_dict())
+
+long = df.melt(id_vars=["ecoregion", "veg_type", "year"], value_vars=list(MECH_VARS),
+               var_name="var", value_name="BA")
+long["mechanism"] = long["var"].map(MECH_VARS)
+
+agg = (long.groupby(["veg_type", "mechanism", "year"], as_index=False)["BA"]
+           .sum(min_count=1)
+           .sort_values(["veg_type", "mechanism", "year"])
+           .reset_index(drop=True))
+
+for (veg, mech), sub in agg.groupby(["veg_type", "mechanism"]):
+    missing_years = sorted(set(YEARS) - set(sub["year"]))
+    if missing_years or sub["BA"].isna().any():
+        raise ValueError(f"Incomplete annual series for {veg}/{mech}: missing {missing_years}")
+
+ma_col = f"BA_{WINDOW}yr"
+agg[ma_col] = (agg.groupby(["veg_type", "mechanism"], sort=False)["BA"]
+                  .transform(lambda s: s.rolling(WINDOW, center=True, min_periods=WINDOW).mean()))
+agg.to_csv(OUT_DIR / f"{OUT_STEM}_series.csv", index=False)
+
+# =====================================================================
+# Trend table (annual series)
+# =====================================================================
+trend_rows = []
+for (veg, mech), sub in agg.groupby(["veg_type", "mechanism"]):
+    sub = sub.sort_values("year")
+    test = mann_kendall_hamed_rao(sub["year"].to_numpy(), sub["BA"].to_numpy())
+    mean_ba = float(sub["BA"].mean())
+    early = float(sub.loc[sub["year"].between(2001, 2012), "BA"].mean())
+    late = float(sub.loc[sub["year"].between(2013, 2024), "BA"].mean())
+    trend_rows.append({
+        "vegetation": VEG_LABEL[veg],
+        "condition": mech,
+        "n_years": len(sub),
+        "mean_annual_ba_km2": mean_ba,
+        "sen_slope_km2_per_year": test["sen_slope"],
+        "sen_slope_pct_per_decade": pct_per_decade(test["sen_slope"], mean_ba),
+        "mk_hamed_rao_z": test["z"],
+        "mk_hamed_rao_p": test["p"],
+        "mean_2001_2012": early,
+        "mean_2013_2024": late,
+        "ratio_2013_2024_to_2001_2012": late / early if early > 0 else np.nan,
+    })
+trend_table = pd.DataFrame(trend_rows)
+trend_table.to_csv(OUT_DIR / "figS9_ba_annual_trends.csv", index=False)
+print("\nTrends on the unsmoothed annual series:")
+print(trend_table.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+
+# =====================================================================
+# Figure: 2 x 4 panels
+# =====================================================================
+mpl.rcParams.update({
+    "font.family": "sans-serif", "font.size": 8,
+    "text.color": "black", "axes.labelcolor": "black", "axes.edgecolor": "black",
+    "axes.titlecolor": "black", "axes.linewidth": 0.8,
+    "axes.labelsize": 8, "axes.titlesize": 9, "axes.grid": False,
+    "xtick.color": "black", "ytick.color": "black",
+    "xtick.labelsize": 7.5, "ytick.labelsize": 7.5,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.width": 0.8, "ytick.major.width": 0.8,
+    "xtick.major.size": 3.0, "ytick.major.size": 3.0,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "savefig.facecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white",
+})
+
+
+def darken(color, amount=LINE_DARKEN):
+    return tuple(np.array(mpl.colors.to_rgb(color)) * (1.0 - amount))
+
+
+fig, axes = plt.subplots(nrows=2, ncols=4, figsize=(7.5, 4.35), sharex=True)
+letters = iter("abcdefgh")
+
+for r, veg in enumerate(VEG_ORDER):
+    for c, mech in enumerate(MECH_ORDER):
+        ax = axes[r, c]
+        sub = agg[(agg["veg_type"] == veg) & (agg["mechanism"] == mech)].sort_values("year")
+        color = MECH_COLOR[mech]
+
+        ax.bar(sub["year"], sub["BA"], width=0.78, color=color,
+               alpha=BAR_ALPHA_OVERRIDE.get(mech, BAR_ALPHA), edgecolor="none", zorder=1)
+        ax.plot(sub["year"], sub[ma_col], color=darken(color), linewidth=2.0,
+                solid_capstyle="round", zorder=3)
+
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color("black")
+            spine.set_linewidth(0.8)
+
+        ax.set_xlim(2000.4, 2024.6)
+        ax.set_xticks([2001, 2007, 2013, 2019, 2024])
+        ax.tick_params(axis="both", which="both", length=3, width=0.8, pad=2)
+
+        ymax = float(np.nanmax(sub["BA"].to_numpy()))
+        ax.set_ylim(0, ymax * 1.20 if ymax > 0 else 1.0)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
+        formatter = ScalarFormatter(useMathText=True)
+        formatter.set_powerlimits((-3, 4))
+        ax.yaxis.set_major_formatter(formatter)
+        ax.yaxis.get_offset_text().set_fontsize(7)
+
+        ax.text(0.03, 0.96, f"({next(letters)})", transform=ax.transAxes,
+                ha="left", va="top", fontsize=8, fontweight="bold")
+
+        if r == 0:
+            # Titles sit above the "x10^n" scale label.
+            title_x = 0.58 if c == len(MECH_ORDER) - 1 else 0.5
+            ax.set_title(mech, x=title_x, y=1.12, pad=0, fontweight="bold")
+            ax.tick_params(axis="x", labelbottom=False)
+        else:
+            ax.tick_params(axis="x", labelrotation=40)
+            for tick_label in ax.get_xticklabels():
+                tick_label.set_ha("right")
+
+        if c == 0:
+            ax.set_ylabel(VEG_LABEL[veg], fontsize=8.5, fontweight="bold", labelpad=4)
+
+fig.legend(handles=[Patch(facecolor="0.55", alpha=BAR_ALPHA, edgecolor="none",
+                          label="Annual values"),
+                    Line2D([0], [0], color="black", linewidth=2.0,
+                           label=f"{WINDOW}-year moving average")],
+           loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.0),
+           fontsize=7.5, handlelength=2.2, columnspacing=1.8)
+
+fig.subplots_adjust(left=0.12, right=0.99, top=0.88, bottom=0.21, wspace=0.32, hspace=0.18)
+fig.supylabel(Y_LABEL, x=0.035, fontsize=8)
+fig.supxlabel("Year", y=0.085, fontsize=8)
+
+for ext in ("png", "pdf"):
+    path = OUT_DIR / f"{OUT_STEM}.{ext}"
+    fig.savefig(path, dpi=DPI, bbox_inches="tight")
+    print(f"Saved: {path}")
+plt.show()
+plt.close(fig)
