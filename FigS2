@@ -1,1 +1,94 @@
+#!/usr/bin/env python3
+"""
+Figure S2. Number of ecoregions by fire-season start month.
+"""
 
+import os
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import xarray as xr
+
+# ============================================================================
+# Paths and settings
+# ============================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "fire_season_statistics.nc"
+OUT_FIG = OUT_DIR / "figS2_hist_fire_season_start.png"
+
+MIN_BA_FS = 1000   # same as units of ba_total_fs in STATS_FILE
+
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+MONTH_COLORS = [
+    "#0571b0", "#4eb3d3", "#a8ddb5", "#41ab5d", "#238b45", "#fee391",
+    "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#8c2d04", "#6a51a3",
+]
+
+if not STATS_FILE.exists():
+    raise FileNotFoundError(f"Missing input file: {STATS_FILE}")
+
+# ============================================================================
+# Load data and count ecoregions per start month
+# ============================================================================
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in ("fire_season_start_month", "ba_total_fs") if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    ba_units = ds["ba_total_fs"].attrs.get("units", "not specified")
+    df = ds[["fire_season_start_month", "ba_total_fs"]].to_dataframe().reset_index()
+
+print(f"ba_total_fs units: {ba_units}")
+df = df[df["ba_total_fs"] > MIN_BA_FS].copy()
+
+start = df["fire_season_start_month"].dropna().round().astype(int)
+if not start.between(1, 12).all():
+    raise ValueError("fire_season_start_month contains values outside 1-12.")
+
+months = np.arange(1, 13)
+counts = start.value_counts().reindex(months, fill_value=0).to_numpy()
+
+print(f"Ecoregions with ba_total_fs > {MIN_BA_FS:,}: {len(df)} "
+      f"({counts.sum()} with a start month)")
+for m, c in zip(months, counts):
+    print(f"  {MONTH_NAMES[m - 1]}: {c:3d}")
+print(f"Most common start month: {MONTH_NAMES[int(np.argmax(counts))]} ({counts.max()} ecoregions)")
+
+# ============================================================================
+# Plot
+# ============================================================================
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.bar(months, counts, color=MONTH_COLORS, edgecolor="black", linewidth=1.5)
+
+ax.set_xlabel("Fire Season Start Month", fontsize=14, fontweight="bold")
+ax.set_ylabel("Number of Ecoregions", fontsize=14, fontweight="bold")
+ax.set_title("Distribution of Fire Season Start Months", fontsize=16, fontweight="bold", pad=10)
+ax.set_xticks(months)
+ax.set_xticklabels(MONTH_NAMES, fontsize=12, fontweight="bold")
+ax.tick_params(axis="y", labelsize=12)
+ax.grid(False)
+
+# Upper limit of 89, raised only if a bar or its label would not fit.
+label_pad = counts.max() * 0.02
+y_top = counts.max() + label_pad
+ax.set_ylim(0, 89 if y_top * 1.06 <= 89 else y_top * 1.1)
+
+for m, c in zip(months, counts):
+    if c > 0:
+        ax.text(m, c + label_pad, str(int(c)), ha="center", va="bottom",
+                fontsize=11, fontweight="bold")
+
+# Black frame on all four sides.
+for spine in ax.spines.values():
+    spine.set_visible(True)
+    spine.set_color("black")
+
+plt.tight_layout()
+plt.savefig(OUT_FIG, dpi=300, bbox_inches="tight")
+print(f"Saved: {OUT_FIG}")
+plt.show()
+plt.close(fig)
