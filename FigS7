@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+Figure S7. Share of fire-season burned area occurring under each condition,
+forest vs. non-forest ecoregions.
+"""
+
+import os
+from pathlib import Path
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu
+
+# =====================================================================
+# Paths and settings
+# =====================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+OUT_STEM = "figS7_ba_share_forest_nonforest"
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+DPI = 600
+ALPHA = 0.05
+
+PCT_COLS = {
+    "CHD":         "pct_ba_chd",
+    "HW-only":     "pct_ba_hw",
+    "DR-only":     "pct_ba_dr",
+    "Non-extreme": "pct_ba_normal",
+}
+MECH_ORDER = ["CHD", "HW-only", "DR-only", "Non-extreme"]
+MECH_COLOR = {"CHD": "k", "HW-only": "#fbb4ae", "DR-only": "#fb8072",
+              "Non-extreme": "#b0b0b0"}
+VEG_ORDER = ["forest", "nonforest"]
+VEG_LABEL = {"forest": "Forest", "nonforest": "Non-forest"}
+FILL_ALPHA = {"forest": 0.85, "nonforest": 0.35}
+
+# Shares stored as fractions (0-1) are converted to percent.
+# "auto" converts when every value is <= 1; set to 1.0 or 100.0 to force.
+PCT_SCALE = "auto"
+
+# Text on the figure: "threshold" -> "p < 0.05" or "n.s.";
+# "exact" -> "p < 0.001" or "p = 0.038". Exact p-values are always saved.
+P_STYLE = "threshold"
+SHOW_N_IN_LABELS = False
+
+Y_LABEL = "Share of fire-season burned area (%BA)"
+
+if not META_CSV.exists():
+    raise FileNotFoundError(f"Missing input file: {META_CSV}")
+
+# =====================================================================
+# Load data
+# =====================================================================
+raw = pd.read_csv(META_CSV)
+req_cols = ["ecoregion", "forest_class", CROPLAND_COL, *PCT_COLS.values()]
+missing = [c for c in req_cols if c not in raw.columns]
+if missing:
+    raise KeyError(f"Missing columns in {META_CSV.name}: {missing}")
+
+df = raw[req_cols].drop_duplicates(subset="ecoregion").copy()
+df = df[df[CROPLAND_COL] == 0].copy()
+for col in PCT_COLS.values():
+    df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+df["veg_type"] = np.where(df["forest_class"].astype(str).str.strip() == "Forest",
+                          "forest", "nonforest")
+
+pct_cols = list(PCT_COLS.values())
+if PCT_SCALE == "auto":
+    scale = 100.0 if np.nanmax(df[pct_cols].to_numpy(dtype=float)) <= 1.0 else 1.0
+else:
+    scale = float(PCT_SCALE)
+if scale != 1.0:
+    print(f"Shares stored as fractions; multiplied by {scale:g}.")
+df[pct_cols] = df[pct_cols] * scale
+
+# Consistency check: the four shares should add up to 100% in each ecoregion.
+share_sum = df[pct_cols].sum(axis=1, min_count=len(pct_cols))
+off = (share_sum - 100.0).abs() > 0.5
+print(f"Ecoregions: forest {int((df['veg_type'] == 'forest').sum())}, "
+      f"non-forest {int((df['veg_type'] == 'nonforest').sum())}")
+print(f"Shares summing to 100% (+/- 0.5): {int((~off & share_sum.notna()).sum())} of "
+      f"{int(share_sum.notna().sum())} ecoregions with all four shares")
+if off.any():
+    print(f"WARNING: {int(off.sum())} ecoregions have shares that do not sum to 100%.")
+
+# =====================================================================
+# Statistics: Mann-Whitney U, forest vs. non-forest
+# =====================================================================
+rows = []
+for mech in MECH_ORDER:
+    col = PCT_COLS[mech]
+    f_vals = df.loc[df["veg_type"] == "forest", col].dropna().to_numpy()
+    nf_vals = df.loc[df["veg_type"] == "nonforest", col].dropna().to_numpy()
+
+    u_two, p_two = mannwhitneyu(f_vals, nf_vals, alternative="two-sided")
+    _, p_f_gt = mannwhitneyu(f_vals, nf_vals, alternative="greater")
+    _, p_nf_gt = mannwhitneyu(f_vals, nf_vals, alternative="less")
+    med_f, med_nf = float(np.median(f_vals)), float(np.median(nf_vals))
+    rel_diff = 100 * (med_f - med_nf) / med_nf if med_nf > 0 else np.nan
+
+    if p_two >= ALPHA:
+        direction = "not significant"
+    elif p_f_gt < p_nf_gt:
+        direction = "forest > non-forest"
+    else:
+        direction = "non-forest > forest"
+
+    rows.append({
+        "condition": mech,
+        "n_forest": len(f_vals),
+        "n_nonforest": len(nf_vals),
+        "median_forest_pct": med_f,
+        "median_nonforest_pct": med_nf,
+        "relative_diff_forest_vs_nonforest_pct": rel_diff,
+        "U_two_sided": u_two,
+        "p_two_sided": p_two,
+        "p_forest_gt_nonforest": p_f_gt,
+        "p_nonforest_gt_forest": p_nf_gt,
+        "significant_direction": direction,
+    })
+    print(f"{mech:<12} median forest = {med_f:.3f}%, non-forest = {med_nf:.3f}% | "
+          f"relative difference {rel_diff:+.1f}% | p two-sided = {p_two:.3g} | {direction}")
+
+stats_df = pd.DataFrame(rows)
+stats_df.to_csv(OUT_DIR / f"{OUT_STEM}_stats.csv", index=False)
+
+# =====================================================================
+# Figure: 1 x 4 panels
+# =====================================================================
+mpl.rcParams.update({
+    "font.family": "sans-serif", "font.size": 8,
+    "text.color": "black", "axes.labelcolor": "black", "axes.edgecolor": "black",
+    "axes.titlecolor": "black", "axes.linewidth": 0.8,
+    "axes.labelsize": 8, "axes.titlesize": 9, "axes.grid": False,
+    "xtick.color": "black", "ytick.color": "black",
+    "xtick.labelsize": 7.5, "ytick.labelsize": 7.5,
+    "xtick.direction": "out", "ytick.direction": "out",
+    "xtick.major.width": 0.8, "ytick.major.width": 0.8,
+    "xtick.major.size": 3.0, "ytick.major.size": 3.0,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "savefig.facecolor": "white", "figure.facecolor": "white", "axes.facecolor": "white",
+})
+
+
+def p_text(p):
+    if P_STYLE == "threshold":
+        return f"p < {ALPHA:g}" if p < ALPHA else "n.s."
+    return "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
+
+
+def is_dark(color):
+    r, g, b = mpl.colors.to_rgb(color)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 0.45
+
+
+fig, axes = plt.subplots(1, 4, figsize=(7.5, 2.9))
+for ax, mech, letter in zip(axes, MECH_ORDER, "abcd"):
+    col, color = PCT_COLS[mech], MECH_COLOR[mech]
+    data = [df.loc[df["veg_type"] == v, col].dropna().to_numpy() for v in VEG_ORDER]
+
+    bp = ax.boxplot(data, positions=[0, 1], widths=0.55, patch_artist=True,
+                    showfliers=False, whis=1.5, zorder=2)
+    for patch, veg in zip(bp["boxes"], VEG_ORDER):
+        patch.set_facecolor(mpl.colors.to_rgba(color, FILL_ALPHA[veg]))
+        patch.set_edgecolor("black")
+        patch.set_linewidth(0.8)
+    for key in ("whiskers", "caps"):
+        for line in bp[key]:
+            line.set_color("black")
+            line.set_linewidth(0.8)
+    for line, veg in zip(bp["medians"], VEG_ORDER):
+        dark_fill = is_dark(color) and FILL_ALPHA[veg] > 0.5
+        line.set_color("white" if dark_fill else "black")
+        line.set_linewidth(1.4)
+
+    # y-range from the whisker tops (outliers hidden) plus room for the bracket.
+    whisk_top = max(float(np.max(line.get_ydata())) for line in bp["whiskers"])
+    ymax = whisk_top if whisk_top > 0 else 1.0
+    ax.set_ylim(0, ymax * 1.25)
+
+    st = stats_df.loc[stats_df["condition"] == mech].iloc[0]
+    y_br, tick = ymax * 1.07, ymax * 0.025
+    ax.plot([0, 0, 1, 1], [y_br - tick, y_br, y_br, y_br - tick], color="black", linewidth=0.8)
+    ax.text(0.5, y_br + tick * 0.6,
+            f"{st['relative_diff_forest_vs_nonforest_pct']:+.1f}%, {p_text(st['p_two_sided'])}",
+            ha="center", va="bottom", fontsize=7, color="black")
+
+    ax.set_xticks([0, 1])
+    if SHOW_N_IN_LABELS:
+        ax.set_xticklabels([f"{VEG_LABEL[v]}\n(n = {len(d)})" for v, d in zip(VEG_ORDER, data)])
+    else:
+        ax.set_xticklabels([VEG_LABEL[v] for v in VEG_ORDER])
+    ax.set_xlim(-0.6, 1.6)
+    ax.set_title(f"({letter}) {mech}", fontweight="bold", pad=6)
+
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(0.8)
+    ax.tick_params(axis="both", length=3, width=0.8, pad=2)
+
+axes[0].set_ylabel(Y_LABEL)
+fig.tight_layout(w_pad=1.2)
+
+for ext in ("png", "pdf"):
+    path = OUT_DIR / f"{OUT_STEM}.{ext}"
+    fig.savefig(path, dpi=DPI, bbox_inches="tight")
+    print(f"Saved: {path}")
+plt.show()
+plt.close(fig)

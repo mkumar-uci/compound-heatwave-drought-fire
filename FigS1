@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+Figure S1. Fire-season start month by ecoregion.
+
+For each ecoregion, the fire season is the four consecutive months with the
+greatest total burned area during 2001-2024; the map shows the first month of
+that four-month period. Only ecoregions with at least 1,000 km^2 of total
+fire-season burned area are shown; grey marks ecoregions with less burned
+area (< 1,000 km^2) or missing data. Unburnable ecoregions are not drawn.
+
+"""
+
+import os
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import xarray as xr
+
+# ============================================================================
+# Paths and settings
+# ============================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "fire_season_statistics.nc"
+ECO_SHP = DATA_DIR / "Ecoregions2017" / "Ecoregions2017_final.shp"
+OUT_FIG = OUT_DIR / "figS1_map_fire_season_start.png"
+
+MIN_BA_FS = 1000   # km^2, total fire-season burned area over 2001-2024
+
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+MONTH_COLORS = [
+    "#0571b0", "#4eb3d3", "#a8ddb5", "#41ab5d", "#238b45", "#fee391",
+    "#fec44f", "#fe9929", "#ec7014", "#cc4c02", "#8c2d04", "#6a51a3",
+]
+
+for f in (STATS_FILE, ECO_SHP):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+# ============================================================================
+# Load data
+# ============================================================================
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in ("fire_season_start_month", "ba_total_fs") if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    ba_units = ds["ba_total_fs"].attrs.get("units", "not specified")
+    df = ds[["fire_season_start_month", "ba_total_fs"]].to_dataframe().reset_index()
+
+print(f"Ecoregions in NetCDF: {df['ecoregion'].nunique()}")
+print(f"ba_total_fs units: {ba_units}")
+
+# Keep ecoregions with at least 1,000 km^2 of total fire-season burned area.
+df = df[df["ba_total_fs"] >= MIN_BA_FS].copy()
+print(f"Ecoregions with ba_total_fs >= {MIN_BA_FS:,} km^2: {len(df)}")
+
+# ============================================================================
+# Merge with ecoregion polygons
+# ============================================================================
+gdf = gpd.read_file(ECO_SHP)
+gdf = gdf[gdf["FOREST"] != "Unburnable"].to_crs(epsg=4326)
+print(f"Burnable ecoregion polygons: {len(gdf)}")
+
+gdf = gdf.merge(df[["ecoregion", "fire_season_start_month"]],
+                left_on="ECO_NAME", right_on="ecoregion", how="left")
+n_unmatched = df.loc[~df["ecoregion"].isin(gdf["ECO_NAME"]), "ecoregion"].nunique()
+if n_unmatched:
+    print(f"WARNING: {n_unmatched} ecoregions in the data have no matching polygon.")
+
+# ============================================================================
+# Plot
+# ============================================================================
+cmap = mcolors.ListedColormap(MONTH_COLORS)
+norm = mcolors.BoundaryNorm(np.arange(0.5, 13.5, 1), ncolors=12)
+
+fig = plt.figure(figsize=(18, 9))
+ax = plt.subplot(1, 1, 1, projection=ccrs.Robinson())
+ax.set_facecolor("white")
+for spine in ax.spines.values():
+    spine.set_edgecolor("black")
+    spine.set_linewidth(2.0)
+
+gdf.plot(
+    column="fire_season_start_month",
+    ax=ax,
+    transform=ccrs.PlateCarree(),
+    cmap=cmap,
+    norm=norm,
+    linewidth=0.3,
+    edgecolor="black",
+    missing_kwds={"color": "lightgrey"},
+    legend=False,
+)
+ax.coastlines(linewidth=1.0, color="black")
+ax.set_global()
+ax.set_title("Fire Season Start Month by Ecoregion", fontsize=20, fontweight="bold", pad=10)
+
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, orientation="horizontal", fraction=0.046, pad=0.05,
+                    ticks=np.arange(1, 13))
+cbar.set_label("Fire Season Start Month", fontsize=14, fontweight="bold")
+cbar.ax.tick_params(labelsize=12, width=1.5, length=5)
+cbar.ax.set_xticklabels(MONTH_NAMES, fontweight="bold")
+
+plt.tight_layout()
+plt.savefig(OUT_FIG, dpi=300, bbox_inches="tight")
+print(f"Saved: {OUT_FIG}")
+plt.show()
+plt.close(fig)

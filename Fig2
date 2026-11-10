@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+Figure 2. Class-specific fire-season burned-area rates (%BA Day^-1) by
+vegetation type and biome.
+
+Rates follow Eq. (1) in the manuscript:
+  100 * (mean annual BA in class k) / (mean annual fire-season BA)
+      / (mean annual number of days in class k), means over 2001-2024.
+
+Excluded ecoregions:
+  - unburnable ecoregions
+  - cropland-dominated ecoregions (cropland_dominated_fs_low_50pct == 1)
+  - ecoregions with < 1,000 km^2 total fire-season burned area over 2001-2024
+    
+"""
+
+import os
+from pathlib import Path
+
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.stats import mannwhitneyu
+
+# ------------------------------------------------------------------
+# Paths and settings
+# ------------------------------------------------------------------
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STATS_FILE = DATA_DIR / "chd_statistics_classdaynorm_per_year.nc"
+META_CSV = DATA_DIR / "ecoregion_metadata.csv"
+OUT_FIG = OUT_DIR / "fig2_ba_rate_forest_biome.png"
+
+CROPLAND_COL = "cropland_dominated_fs_low_50pct"
+N_BOOT = 10000
+SEED = 42
+ALPHA = 0.05
+UNIT = "%BA Day$^{-1}$"
+
+COLOR_FOREST = "#2d7f2d"
+COLOR_NONFOREST = "#c66b2e"
+CLASS_COLOR = {"CHD": "k", "DR-only": "#fb8072", "HW-only": "#fbb4ae",
+               "Non-extreme": "0.75"}
+STAR_COLOR = {"DR-only": "#fb8072", "HW-only": "#fbb4ae", "Non-extreme": "#b0b0b0"}
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.labelsize": 13,
+    "axes.titlesize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 11,
+    "axes.linewidth": 1.5,
+})
+
+for f in (STATS_FILE, META_CSV):
+    if not f.exists():
+        raise FileNotFoundError(f"Missing input file: {f}")
+
+# ------------------------------------------------------------------
+# Load 2001-2024 mean class-specific rates (dimension: ecoregion)
+# ------------------------------------------------------------------
+RATE_VARS = {
+    "ba_rate_chd_perCHD":          "ba_rate_chd",
+    "ba_rate_heatwave_only_perHW": "ba_rate_hw",
+    "ba_rate_drought_only_perDR":  "ba_rate_dr",
+    "ba_rate_no_extremes_perNE":   "ba_rate_normal",
+}
+with xr.open_dataset(STATS_FILE) as ds:
+    missing = [v for v in RATE_VARS if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in NetCDF: {missing}")
+    df_rates = ds[list(RATE_VARS)].to_dataframe().reset_index()
+df_rates = df_rates.rename(columns=RATE_VARS)
+print(f"Ecoregions in NetCDF: {df_rates['ecoregion'].nunique()}")
+
+meta_cols = ["ecoregion", "biome_name", "forest_class", CROPLAND_COL]
+meta = pd.read_csv(META_CSV)
+missing_meta = [c for c in meta_cols if c not in meta.columns]
+if missing_meta:
+    raise KeyError(f"Metadata CSV is missing columns: {missing_meta}")
+meta = meta[meta_cols].drop_duplicates(subset="ecoregion")
+
+df = df_rates.merge(meta, on="ecoregion", how="inner", validate="one_to_one")
+df = df[df[CROPLAND_COL] == 0].copy()
+print(f"Ecoregions after cropland filter: {df['ecoregion'].nunique()}")
+
+rate_cols = list(RATE_VARS.values())
+# A class with zero days in an ecoregion gives an undefined rate.
+df[rate_cols] = df[rate_cols].replace([np.inf, -np.inf], np.nan)
+df["veg_type"] = np.where(df["forest_class"].astype(str).str.strip() == "Forest",
+                          "forest", "nonforest")
+
+
+def paired_bootstrap_median_diff(x, y, n_boot=N_BOOT, seed=SEED):
+    """Bootstrap the median of paired differences x - y (same ecoregions).
+
+    p_one is the one-sided p-value for H1: median(x - y) > 0.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    d = x[ok] - y[ok]
+    if d.size == 0:
+        return None
+    rng = np.random.default_rng(seed)
+    boot = np.median(rng.choice(d, size=(n_boot, d.size), replace=True), axis=1)
+    ci_low, ci_high = np.percentile(boot, [2.5, 97.5])
+    return {"n": d.size, "obs_diff": float(np.median(d)), "ci_low": ci_low,
+            "ci_high": ci_high, "p_one": float((boot <= 0.0).mean())}
+
+
+# ------------------------------------------------------------------
+# Panel A: forest vs. non-forest (Mann-Whitney U)
+# ------------------------------------------------------------------
+forest_df = df[df["veg_type"] == "forest"]
+nonforest_df = df[df["veg_type"] == "nonforest"]
+
+mechs_a = ["CHD", "HW-only", "DR-only", "Non-extreme"]
+cols_a = ["ba_rate_chd", "ba_rate_hw", "ba_rate_dr", "ba_rate_normal"]
+
+print("\n=== Panel A: Mann-Whitney U, forest vs. non-forest (one value per ecoregion) ===")
+sig_a = {}
+for mech, col in zip(mechs_a, cols_a):
+    f_vals = forest_df[col].dropna().to_numpy()
+    nf_vals = nonforest_df[col].dropna().to_numpy()
+    if f_vals.size == 0 or nf_vals.size == 0:
+        continue
+
+    u_stat, p_two = mannwhitneyu(f_vals, nf_vals, alternative="two-sided")
+    _, p_f_gt_nf = mannwhitneyu(f_vals, nf_vals, alternative="greater")
+    _, p_nf_gt_f = mannwhitneyu(f_vals, nf_vals, alternative="less")
+    med_f, med_nf = np.median(f_vals), np.median(nf_vals)
+
+    direction, pct_diff = "none", np.nan
+    if p_two < ALPHA:
+        if p_f_gt_nf < ALPHA:
+            direction = "forest"
+            pct_diff = 100.0 * (med_f - med_nf) / med_nf if med_nf > 0 else np.nan
+        elif p_nf_gt_f < ALPHA:
+            direction = "nonforest"
+            pct_diff = 100.0 * (med_nf - med_f) / med_f if med_f > 0 else np.nan
+    sig_a[mech] = {"direction": direction, "pct_diff": pct_diff}
+
+    print(f"\n{mech}  (n_forest = {f_vals.size}, n_nonforest = {nf_vals.size})")
+    print(f"  median forest     = {med_f:.4f} %BA Day^-1")
+    print(f"  median non-forest = {med_nf:.4f} %BA Day^-1")
+    print(f"  U = {u_stat:.1f}, p two-sided = {p_two:.4f}, "
+          f"p(forest > non) = {p_f_gt_nf:.4f}, p(non > forest) = {p_nf_gt_f:.4f}")
+    if direction == "none":
+        print("  Result: no significant difference")
+    else:
+        print(f"  Result: {direction} significantly higher by {pct_diff:.1f}% (medians)")
+
+# ------------------------------------------------------------------
+# Panel B: biome medians and paired bootstrap (CHD vs. each class)
+# ------------------------------------------------------------------
+biome_medians = (
+    df.groupby("biome_name", as_index=False)[cols_a].median()
+      .sort_values("ba_rate_chd", ascending=True)
+)
+labels_b = biome_medians["biome_name"].to_numpy()
+chd_b = biome_medians["ba_rate_chd"].to_numpy()
+hw_b = biome_medians["ba_rate_hw"].to_numpy()
+dr_b = biome_medians["ba_rate_dr"].to_numpy()
+none_b = biome_medians["ba_rate_normal"].to_numpy()
+
+print("\n=== Panel B: paired bootstrap within biomes, p = P(median(CHD - other) <= 0) ===")
+per_biome_sig = {}
+for biome in labels_b:
+    sub = df[df["biome_name"] == biome]
+    chd_vals = sub["ba_rate_chd"].to_numpy()
+    per_biome_sig[biome] = {}
+    for lab, col in [("HW-only", "ba_rate_hw"), ("DR-only", "ba_rate_dr"),
+                     ("Non-extreme", "ba_rate_normal")]:
+        res = paired_bootstrap_median_diff(chd_vals, sub[col].to_numpy())
+        if res is None:
+            continue
+        print(f"{biome[:45]:<45} CHD vs {lab:<11} n = {res['n']:>3}  "
+              f"median diff = {res['obs_diff']:8.4f}  "
+              f"95% CI [{res['ci_low']:.4f}, {res['ci_high']:.4f}]  "
+              f"bootstrap p = {res['p_one']:.4f}")
+        per_biome_sig[biome][lab] = res["p_one"]
+
+# ------------------------------------------------------------------
+# Axis limits
+# ------------------------------------------------------------------
+def upper_whisker(values):
+    """Top of a boxplot whisker (largest value within Q3 + 1.5 * IQR)."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    q1, q3 = np.percentile(v, [25, 75])
+    return v[v <= q3 + 1.5 * (q3 - q1)].max()
+
+
+whisker_max = max(upper_whisker(d[c]) for d in (forest_df, nonforest_df)
+                  for c in cols_a if d[c].notna().any())
+ylim_a = float(np.ceil(whisker_max * 1.1))   # 10% headroom above the highest whisker
+
+xmax_b = float(np.nanmax([none_b, hw_b, dr_b, chd_b]))
+xlim_b = max(6.0, float(np.ceil(xmax_b * 1.1)))
+print(f"\nPanel A y-limit: {ylim_a:.1f}; panel B x-limit: {xlim_b:.1f}")
+
+# ------------------------------------------------------------------
+# Figure
+# ------------------------------------------------------------------
+fig, (ax_a, ax_b) = plt.subplots(2, 1, figsize=(11, 9),
+                                 gridspec_kw={"height_ratios": [1.1, 1.6]})
+
+# Panel A
+x_centers = np.arange(len(mechs_a))
+offset = 0.2
+pos_f = x_centers - offset
+pos_nf = x_centers + offset
+data_f = [forest_df[c].dropna().to_numpy() for c in cols_a]
+data_nf = [nonforest_df[c].dropna().to_numpy() for c in cols_a]
+
+box_kw = dict(widths=0.32, patch_artist=True, showfliers=False, whis=1.5,
+              medianprops=dict(color="black", linewidth=1.8),
+              whiskerprops=dict(linewidth=1.4), capprops=dict(linewidth=1.4))
+ax_a.boxplot(data_f, positions=pos_f,
+             boxprops=dict(linewidth=1.6, alpha=0.9, facecolor=COLOR_FOREST), **box_kw)
+ax_a.boxplot(data_nf, positions=pos_nf,
+             boxprops=dict(linewidth=1.6, alpha=0.9, facecolor=COLOR_NONFOREST), **box_kw)
+
+ax_a.set_xticks(x_centers)
+ax_a.set_xticklabels(mechs_a, fontsize=12)
+ax_a.set_xlim(-0.43, x_centers[-1] + 0.43)
+ax_a.set_ylabel(UNIT, fontsize=13)
+ax_a.set_ylim(-0.1, ylim_a)
+tick_step = 1.0 if ylim_a <= 8 else 2.0
+ax_a.set_yticks(np.arange(0, ylim_a + 1e-9, tick_step))
+ax_a.set_title("(a) Forest vs. Non-forest", fontsize=15, pad=10)
+ax_a.tick_params(labelsize=11, width=1.5, length=6)
+
+for i, mech in enumerate(mechs_a):
+    res = sig_a.get(mech)
+    if res is None or res["direction"] == "none":
+        continue
+    if res["direction"] == "forest":
+        x_star, vals, color = pos_f[i] + 0.09, data_f[i], COLOR_FOREST
+    else:
+        x_star, vals, color = pos_nf[i] + 0.07, data_nf[i], COLOR_NONFOREST
+    y_star = min(ylim_a * 0.92, np.percentile(vals, 75) * 0.95)
+    ax_a.text(x_star, y_star, "*", ha="center", va="bottom", fontsize=18,
+              fontweight="bold", color=color,
+              path_effects=[pe.withStroke(linewidth=2, foreground="white")])
+
+leg = ax_a.legend(handles=[plt.Line2D([0], [0], color=COLOR_FOREST, lw=8, label="Forest"),
+                           plt.Line2D([0], [0], color=COLOR_NONFOREST, lw=8, label="Non-forest")],
+                  loc="upper right", frameon=True, fontsize=11)
+leg.get_frame().set_edgecolor("lightgray")
+leg.get_frame().set_linewidth(0.8)
+
+# Panel B
+y = np.arange(len(labels_b))
+h = 0.20
+ax_b.barh(y - 1.5 * h, chd_b, height=h, color=CLASS_COLOR["CHD"], label="CHD", edgecolor="none")
+ax_b.barh(y - 0.5 * h, dr_b, height=h, color=CLASS_COLOR["DR-only"], label="DR-only", edgecolor="none")
+ax_b.barh(y + 0.5 * h, hw_b, height=h, color=CLASS_COLOR["HW-only"], label="HW-only", edgecolor="none")
+ax_b.barh(y + 1.5 * h, none_b, height=h, color=CLASS_COLOR["Non-extreme"], label="Non-extreme",
+          edgecolor="none")
+
+ax_b.set_xlim(0, xlim_b)
+ax_b.set_yticks(y)
+ax_b.set_yticklabels(labels_b)
+ax_b.set_ylim(-0.55, y[-1] + 0.55)
+ax_b.set_xlabel(UNIT, fontsize=13)
+ax_b.set_title("(b) Biomes", fontsize=15, pad=10)
+ax_b.tick_params(axis="x", labelsize=11, width=1.5, length=6)
+ax_b.tick_params(axis="y", labelsize=11, width=1.5, length=4)
+
+# Stars to the right of the CHD bar, one per class that CHD exceeds significantly.
+star_dx = {"DR-only": 0.012 * xlim_b, "HW-only": 0.044 * xlim_b, "Non-extreme": 0.076 * xlim_b}
+for i, biome in enumerate(labels_b):
+    for other in ["DR-only", "HW-only", "Non-extreme"]:
+        p = per_biome_sig.get(biome, {}).get(other)
+        if p is None or p >= ALPHA:
+            continue
+        ax_b.text(chd_b[i] + star_dx[other], y[i] - 1.5 * h - 0.1, "*",
+                  color=STAR_COLOR[other], va="center", ha="left",
+                  fontweight="bold", fontsize=16)
+
+handles, labels = ax_b.get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+order_b = ["Non-extreme", "HW-only", "DR-only", "CHD"]
+ax_b.legend([by_label[m] for m in order_b], order_b, frameon=False,
+            loc="lower right", fontsize=11)
+
+# Black frame on all four sides of both panels.
+for ax in (ax_a, ax_b):
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(1.5)
+
+plt.tight_layout()
+plt.subplots_adjust(hspace=0.18)
+plt.savefig(OUT_FIG, dpi=600, bbox_inches="tight")
+print(f"\nSaved: {OUT_FIG}")
+plt.show()
+plt.close(fig)

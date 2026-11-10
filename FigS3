@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""
+Figure S3. Map of forest and non-forest ecoregions.
+
+Ecoregions are classified using the forest/non-forest field (FOREST) of the
+ecoregion dataset and shown as forest (green) or non-forest (red). Only
+burnable ecoregions are shown; unburnable ecoregions are excluded. The legend
+gives the number of ecoregions in each class.
+"""
+
+import os
+import warnings
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import geopandas as gpd
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore", message="Geometry is in a geographic CRS")
+
+# ============================================================================
+# Paths and settings
+# ============================================================================
+DATA_DIR = Path(os.environ.get("CHD_DATA_DIR", "data"))
+OUT_DIR = Path(os.environ.get("CHD_OUT_DIR", "figures"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ECO_SHP = DATA_DIR / "Ecoregions2017" / "Ecoregions2017_final.shp"
+OUT_FIG = OUT_DIR / "figS3_map_forest_nonforest.png"
+
+COLOR_FOREST = "forestgreen"
+COLOR_NONFOREST = "firebrick"
+LEGEND_X, LEGEND_Y = 0.05, 0.28   # legend position (axes fraction)
+
+if not ECO_SHP.exists():
+    raise FileNotFoundError(f"Missing input file: {ECO_SHP}")
+
+# ============================================================================
+# Load and classify ecoregions
+# ============================================================================
+gdf = gpd.read_file(ECO_SHP)
+for col in ("ECO_NAME", "FOREST"):
+    if col not in gdf.columns:
+        raise KeyError(f"Shapefile is missing the '{col}' attribute.")
+
+forest_attr = gdf["FOREST"].astype(str).str.strip()
+gdf = gdf[~forest_attr.str.contains("Unburnable", case=False, na=False)].copy()
+gdf["is_forest"] = gdf["FOREST"].astype(str).str.strip() == "Forest"
+
+print("FOREST values among burnable ecoregions:",
+      sorted(gdf["FOREST"].dropna().astype(str).unique()))
+
+# Count ecoregions by name, so an ecoregion split into several polygons counts once.
+n_forest = gdf.loc[gdf["is_forest"], "ECO_NAME"].nunique()
+n_nonforest = gdf.loc[~gdf["is_forest"], "ECO_NAME"].nunique()
+print(f"Burnable ecoregions: {gdf['ECO_NAME'].nunique()} "
+      f"(forest {n_forest}, non-forest {n_nonforest}; {len(gdf)} shapefile rows)")
+
+if gdf.crs is None:
+    raise ValueError("Shapefile has no coordinate reference system.")
+gdf = gdf.to_crs(epsg=4326)
+
+# ============================================================================
+# Plot
+# ============================================================================
+fig = plt.figure(figsize=(24, 9))
+fig.patch.set_facecolor("white")
+ax = plt.subplot(1, 1, 1, projection=ccrs.Robinson())
+ax.set_facecolor("white")
+for spine in ax.spines.values():
+    spine.set_edgecolor("black")
+    spine.set_linewidth(2.0)
+
+for mask, color in [(gdf["is_forest"], COLOR_FOREST), (~gdf["is_forest"], COLOR_NONFOREST)]:
+    subset = gdf[mask]
+    if len(subset):
+        subset.plot(ax=ax, transform=ccrs.PlateCarree(), color=color,
+                    edgecolor="black", linewidth=0.3)
+
+ax.coastlines(linewidth=1.0, color="black")
+ax.set_global()
+ax.set_title("Forest vs Non-Forest Ecoregions", fontsize=22, fontweight="bold", pad=12)
+
+legend = ax.legend(
+    handles=[mpatches.Patch(color=COLOR_FOREST, label=f"Forest (n={n_forest})"),
+             mpatches.Patch(color=COLOR_NONFOREST, label=f"Non-forest (n={n_nonforest})")],
+    loc="lower left",
+    bbox_to_anchor=(LEGEND_X, LEGEND_Y),
+    fontsize=16,
+    frameon=True,
+    fancybox=True,
+    shadow=False,
+    borderpad=1.0,
+    labelspacing=0.8,
+)
+legend.get_frame().set_edgecolor("none")
+legend.get_frame().set_alpha(0.95)
+
+plt.tight_layout()
+plt.savefig(OUT_FIG, dpi=600, bbox_inches="tight")
+print(f"Saved: {OUT_FIG}")
+plt.show()
+plt.close(fig)
